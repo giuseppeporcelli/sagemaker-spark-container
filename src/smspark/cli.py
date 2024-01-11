@@ -15,10 +15,12 @@ import logging
 import pathlib
 import shlex
 import sys
+import os
 from typing import Any, Dict, Sequence
 from urllib.parse import urlparse
 
 import click
+from smspark import constants
 from smspark.errors import AlgorithmError, BaseError, InputError
 from smspark.job import ProcessingJobManager
 
@@ -234,4 +236,10 @@ def _construct_spark_submit_command(spark_opts: Dict[str, Any], app_and_app_argu
     cmd.extend(spark_options_list)
     cmd.extend(app_and_app_arguments)
     cmd_string = " ".join(shlex.quote(c) for c in cmd)
+    
+    driver_log_destination = int(os.getenv("AWS_SPARK_DRIVER_LOG_DESTINATION",
+                                           str(constants.AWS_SPARK_DRIVER_LOG_DESTINATION_NONE)))
+    if driver_log_destination != constants.AWS_SPARK_DRIVER_LOG_DESTINATION_NONE:
+        cmd_string = cmd_string + " > /var/log/spark_driver_logs.txt 2>&1"
+
     return cmd_string

@@ -11,6 +11,7 @@
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
 """Manages the lifecycle of a running Spark job."""
+import os
 import json
 import logging
 import socket
@@ -19,16 +20,18 @@ import traceback
 from typing import Any, Dict, Mapping, Sequence
 
 from requests.exceptions import ConnectionError
+from smspark import constants
 from smspark.bootstrapper import Bootstrapper
 from smspark.defaults import default_processing_job_config, default_resource_config
 from smspark.errors import AlgorithmError
 from smspark.spark_event_logs_publisher import SparkEventLogPublisher
+from smspark.spark_driver_logs_publisher import SparkDriverLogsPublisher
+from smspark.spark_executor_logs_publisher import SparkExecutorLogsPublisher
 from smspark.spark_executor_logs_watcher import SparkExecutorLogsWatcher
 from smspark.status import Status, StatusApp, StatusClient, StatusMessage, StatusServer
 from smspark.waiter import Waiter
 from smspark.config_path_utils import get_config_path, ConfigPathTypes
 from tenacity import retry, stop_after_delay
-
 
 class ProcessingJobManager(object):
     """Manages the lifecycle of a Spark job."""
@@ -120,12 +123,32 @@ class ProcessingJobManager(object):
         self._bootstrap_yarn()
         self.logger.info("starting executor logs watcher")
         self._start_executor_logs_watcher()
+        
+        executor_log_destination = int(os.getenv("AWS_SPARK_EXECUTOR_LOG_DESTINATION",
+                                                 str(constants.AWS_SPARK_EXECUTOR_LOG_DESTINATION_NONE)))
+        if executor_log_destination != constants.AWS_SPARK_EXECUTOR_LOG_DESTINATION_NONE:
+            self.logger.info("starting executor log publisher")
+            spark_executor_logs_s3_bucket = os.getenv("AWS_SPARK_EXECUTOR_LOG_S3_BUCKET_NAME", "")
+            spark_executor_logs_s3_prefix = os.getenv("AWS_SPARK_EXECUTOR_LOG_S3_BUCKET_PREFIX", "")
+            spark_executor_logs_publisher = self._start_spark_executor_log_publisher(
+                spark_executor_logs_s3_bucket, spark_executor_logs_s3_prefix
+            )
 
         if self._is_primary_host:
             self.logger.info("start log event log publisher")
             spark_log_publisher = self._start_spark_event_log_publisher(
                 spark_event_logs_s3_uri, local_spark_event_logs_dir
             )
+
+            driver_log_destination = int(os.getenv("AWS_SPARK_DRIVER_LOG_DESTINATION",
+                                                   str(constants.AWS_SPARK_DRIVER_LOG_DESTINATION_NONE)))
+            if driver_log_destination != constants.AWS_SPARK_DRIVER_LOG_DESTINATION_NONE:
+                self.logger.info("starting driver log publisher")
+                spark_driver_logs_s3_bucket = os.getenv("AWS_SPARK_DRIVER_LOG_S3_BUCKET_NAME", "")
+                spark_driver_logs_s3_prefix = os.getenv("AWS_SPARK_DRIVER_LOG_S3_BUCKET_PREFIX", "")
+                spark_driver_logs_publisher = self._start_spark_driver_log_publisher(
+                    spark_driver_logs_s3_bucket, spark_driver_logs_s3_prefix
+                )
 
             self.logger.info(f"Waiting for hosts to bootstrap: {self.hosts}")
 
@@ -167,8 +190,13 @@ class ProcessingJobManager(object):
                 )
 
             finally:
+
                 spark_log_publisher.down()
                 spark_log_publisher.join(timeout=20)
+
+                if driver_log_destination != constants.AWS_SPARK_DRIVER_LOG_DESTINATION_NONE:
+                    spark_driver_logs_publisher.down()
+                    spark_driver_logs_publisher.join(timeout=20)
 
         else:
             # workers wait until the primary is up, then wait until it's down.
@@ -187,6 +215,10 @@ class ProcessingJobManager(object):
             self.logger.info("waiting for the primary to go down")
             self.waiter.wait_for(primary_is_down, timeout=float("inf"), period=5.0)
             self.logger.info("primary is down, worker now exiting")
+            
+        if executor_log_destination != constants.AWS_SPARK_EXECUTOR_LOG_DESTINATION_NONE:
+            spark_executor_logs_publisher.down()
+            spark_executor_logs_publisher.join(timeout=20)
 
     def _bootstrap_yarn(self) -> None:
         self.status_app.status = Status.BOOTSTRAPPING
@@ -211,3 +243,21 @@ class ProcessingJobManager(object):
         spark_log_publisher.daemon = True
         spark_log_publisher.start()
         return spark_log_publisher
+
+    def _start_spark_driver_log_publisher(
+        self, spark_driver_logs_s3_bucket: str, spark_driver_logs_s3_prefix: str
+    ) -> SparkDriverLogsPublisher:
+        spark_driver_logs_publisher = SparkDriverLogsPublisher(spark_driver_logs_s3_bucket, 
+                                                               spark_driver_logs_s3_prefix)
+        spark_driver_logs_publisher.daemon = True
+        spark_driver_logs_publisher.start()
+        return spark_driver_logs_publisher
+    
+    def _start_spark_executor_log_publisher(
+        self, spark_executor_logs_s3_bucket: str, spark_executor_logs_s3_prefix: str
+    ) -> SparkExecutorLogsPublisher:
+        spark_executor_logs_publisher = SparkExecutorLogsPublisher(spark_executor_logs_s3_bucket, 
+                                                                   spark_executor_logs_s3_prefix)
+        spark_executor_logs_publisher.daemon = True
+        spark_executor_logs_publisher.start()
+        return spark_executor_logs_publisher
